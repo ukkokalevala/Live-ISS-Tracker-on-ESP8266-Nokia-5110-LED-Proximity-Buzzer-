@@ -1,0 +1,206 @@
+#include <ESP8266WiFi.h>
+#include <SPI.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_PCD8544.h>
+#include <WiFiClientSecure.h>
+#include <ESP8266HTTPClient.h>
+#include <ArduinoJson.h>
+#include "secrets.h"
+
+// ===== Wemos D1 Hardware SPI (working config) =====
+#define DC_PIN   12   // D6
+#define CE_PIN   5    // D1
+#define RST_PIN  4    // D2
+Adafruit_PCD8544 display = Adafruit_PCD8544(DC_PIN, CE_PIN, RST_PIN);
+
+// ===== LED / Buzzer =====
+#define LED_PIN    15   // D8  (PWM)
+#define BUZZER_PIN 16   // D0  (digital on/off)
+
+// Distance thresholds (km)
+const float FADE_MIN_KM = 400.0;    // LED fully bright at or below this
+const float FADE_MAX_KM = 5000.0;   // LED fully off at or above this
+const float CLOSE_KM    = 1000.0;   // "close" beep zone
+
+// N2YO API
+String apiKey = "NH74CL-F9XL2D-EU42SJ-5CZB";
+String satID  = "25544";
+
+const float myLat = -33.9249;
+const float myLon = 18.4241;
+
+// State for closest-approach tracking
+float   bestDistance   = 1e9;
+bool    inCloseZone    = false;
+
+// ---------- LED helpers ----------
+void ledOff()       { analogWrite(LED_PIN, 0); }
+void ledFull()      { analogWrite(LED_PIN, 255); }
+
+uint8_t distanceToPwm(float km) {
+  if (isnan(km) || km < 0) return 0;
+  if (km <= FADE_MIN_KM)   return 255;
+  if (km >= FADE_MAX_KM)   return 0;
+  float t = (FADE_MAX_KM - km) / (FADE_MAX_KM - FADE_MIN_KM); // 0..1
+  return (uint8_t)(t * 255.0f);
+}
+
+// ---------- Buzzer helpers ----------
+void beep(uint16_t ms = 120) {
+  digitalWrite(BUZZER_PIN, HIGH);
+  delay(ms);
+  digitalWrite(BUZZER_PIN, LOW);
+}
+void beepPattern(uint8_t count = 2, uint16_t onMs = 90, uint16_t offMs = 70) {
+  for (uint8_t i = 0; i < count; i++) {
+    digitalWrite(BUZZER_PIN, HIGH);
+    delay(onMs);
+    digitalWrite(BUZZER_PIN, LOW);
+    if (i < count - 1) delay(offMs);
+  }
+}
+
+// ---------- Setup ----------
+void setup() {
+  Serial.begin(9600);
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  ledOff();
+  digitalWrite(BUZZER_PIN, LOW);
+
+  display.begin();
+  display.setContrast(40);
+  display.setRotation(2);
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(BLACK);
+  display.setCursor(0, 0);
+  display.println("ISS Tracker");
+  display.display();
+  delay(1500);
+
+  // Quick self-test
+  ledFull();  delay(250);
+  ledOff();   delay(100);
+  beep(80);
+
+  Serial.println("Connecting to WiFi...");
+  WiFi.begin(ssid, password);
+  unsigned long t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 30000) {
+    delay(500);
+    Serial.print(".");
+    yield();
+  }
+  Serial.println();
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("IP: "); Serial.println(WiFi.localIP());
+    fetchISSData();
+  } else {
+    Serial.println("WiFi FAIL");
+    display.clearDisplay();
+    display.setCursor(0, 0);
+    display.println("WiFi FAIL");
+    display.display();
+  }
+}
+
+// ---------- Main fetch ----------
+void fetchISSData() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setTimeout(5000);
+
+  HTTPClient http;
+  String url = "https://api.n2yo.com/rest/v1/satellite/positions/" + satID +
+               "/" + String(myLat, 4) + "/" + String(myLon, 4) +
+               "/0/1/&apiKey=" + apiKey;
+
+  http.begin(client, url);
+  int httpCode = http.GET();
+
+  if (httpCode > 0) {
+    String payload = http.getString();
+    Serial.print("HTTP "); Serial.println(httpCode);
+
+    StaticJsonDocument<768> doc;
+    DeserializationError err = deserializeJson(doc, payload);
+    if (!err) {
+      float satLat   = doc["positions"][0]["satlatitude"]  | 0.0f;
+      float satLon   = doc["positions"][0]["satlongitude"] | 0.0f;
+      float distance = calculateDistance(myLat, myLon, satLat, satLon);
+
+      // ----- LED: brightness from distance -----
+      uint8_t pwm = distanceToPwm(distance);
+      analogWrite(LED_PIN, pwm);
+
+      // ----- Buzzer: closest-approach + enter close zone -----
+      if (distance < bestDistance) {
+        // New record — only beep if it's a meaningful improvement, to avoid
+        // buzzing every single update when distance is shrinking
+        bestDistance = distance;
+      }
+      if (!inCloseZone && distance <= CLOSE_KM) {
+        inCloseZone = true;
+        beepPattern(3, 80, 60);   // entered close zone
+      } else if (inCloseZone && distance > CLOSE_KM * 1.05) {
+        inCloseZone = false;      // hysteresis so it doesn't chatter
+      }
+
+      // ----- Display -----
+      display.clearDisplay();
+      display.setCursor(0, 0);
+      display.println("ISS Tracker");
+
+      display.setCursor(0, 10);
+      display.print("Lat: ");
+      display.println(satLat, 4);
+
+      display.setCursor(0, 20);
+      display.print("Lon: ");
+      display.println(satLon, 4);
+
+      display.setCursor(0, 30);
+      display.print("Dist: ");
+      display.print(distance, 1);
+      display.println(" km");
+
+      display.setCursor(0, 40);
+      display.print("Best: ");
+      display.print(bestDistance, 1);
+      display.print(" km");
+
+      display.display();
+
+      Serial.print("Dist: ");   Serial.print(distance, 1);
+      Serial.print(" km  PWM="); Serial.print(pwm);
+      Serial.print("  Best=");   Serial.println(bestDistance, 1);
+    } else {
+      Serial.print("JSON error: "); Serial.println(err.c_str());
+    }
+  } else {
+    Serial.print("HTTP error: "); Serial.println(httpCode);
+    ledOff(); // don't leave LED stuck on
+  }
+  http.end();
+}
+
+// ---------- Distance ----------
+float calculateDistance(float lat1, float lon1, float lat2, float lon2) {
+  const float R = 6371.0;
+  float dLat = radians(lat2 - lat1);
+  float dLon = radians(lon2 - lon1);
+  float a = sin(dLat / 2) * sin(dLat / 2) +
+            cos(radians(lat1)) * cos(radians(lat2)) *
+            sin(dLon / 2) * sin(dLon / 2);
+  float c = 2 * atan2(sqrt(a), sqrt(1 - a));
+  return R * c;
+}
+
+// ---------- Loop ----------
+void loop() {
+  delay(10000);
+  fetchISSData();
+}
